@@ -1,0 +1,259 @@
+name: Carry a documentation or translation change upstream
+
+# **This repository is generated, so a pull request here cannot be merged.**
+#
+# Everything you can see is rendered from a private source repository and
+# force-pushed onto `main` with a fresh history every time the documentation
+# changes. Merging a pull request here would put a commit on `main` that the
+# next publish destroys — the change would appear to land and then silently
+# vanish, which is the worst of every option.
+#
+# So a documentation change is *carried upstream* instead: this reads the
+# proposed file contents, opens the equivalent pull request against the private
+# repository, tells the contributor where it went, and closes the one here. The
+# change then comes back down through the normal publish, with attribution
+# preserved in the upstream commit.
+#
+# **The contributor's branch is never checked out and nothing from it is ever
+# executed.** `pull_request_target` runs with this repository's secrets, and
+# checking out a fork's code under it is the classic way to hand a stranger a
+# token. Only file *contents* are fetched, through the API, and only for paths
+# that pass the filter below.
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+    paths:
+      - "docs/**"
+      - "translations/**"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: upstream-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  carry:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect the proposed changes
+        id: collect
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              { ...context.repo, pull_number: pr.number, per_page: 100 },
+            );
+
+            // **Prose and strings only.** A pull request that touches
+            // anything else is not something to carry into the source
+            // repository unreviewed -- and a workflow file above all, which
+            // is how a contributor would get this job to run their code.
+            //
+            // `template.json` is excluded on purpose: it is generated from
+            // the application's own source by `extract_strings.py`, so an
+            // edit to it would be overwritten and is a sign somebody has
+            // misunderstood which file to change.
+            const allowed = (name) =>
+              !name.includes("..") &&
+              ((name.startsWith("docs/") && name.endsWith(".md")) ||
+               (name.startsWith("translations/") &&
+                name.endsWith(".json") &&
+                name !== "translations/template.json"));
+
+            const rejected = files.filter((f) => !allowed(f.filename));
+            const wanted = files.filter(
+              (f) => allowed(f.filename) && f.status !== "removed",
+            );
+
+            core.setOutput("rejected", JSON.stringify(
+              rejected.map((f) => f.filename)));
+
+            // Contents are read at the pull request's head. `getContent` on a
+            // fork ref returns the file as proposed without fetching the
+            // branch, so nothing from it lands on this runner as code.
+            const out = [];
+            for (const file of wanted) {
+              const res = await github.rest.repos.getContent({
+                owner: pr.head.repo.owner.login,
+                repo: pr.head.repo.name,
+                path: file.filename,
+                ref: pr.head.sha,
+              });
+              out.push({
+                path: file.filename,
+                text: Buffer.from(res.data.content, "base64").toString("utf8"),
+              });
+            }
+            core.setOutput("files", JSON.stringify(out));
+            core.setOutput("count", String(out.length));
+
+      - name: Refuse anything outside docs and translations
+        if: steps.collect.outputs.rejected != '[]'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const rejected = JSON.parse('${{ steps.collect.outputs.rejected }}');
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                "Thanks — but this pull request touches files that are",
+                "neither documentation nor translations, and this repository",
+                "is generated, so nothing here can be edited directly:",
+                "",
+                ...rejected.map((f) => "- `" + f + "`"),
+                "",
+                "Please open a pull request with just the docs or",
+                "translation changes and they will be carried upstream",
+                "automatically.",
+                "For anything else, open an issue describing what you would",
+                "like changed.",
+              ].join("\n"),
+            });
+            core.setFailed("the pull request changes files outside docs/ and translations/");
+
+      - name: Check out the source repository
+        if: steps.collect.outputs.count != '0'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.UPSTREAM_REPO || 'kidunot89/simpitradio-source' }}
+          token: ${{ secrets.UPSTREAM_TOKEN }}
+          path: upstream
+
+      - name: Apply the change upstream
+        if: steps.collect.outputs.count != '0'
+        id: apply
+        env:
+          FILES: ${{ steps.collect.outputs.files }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          cd upstream
+          branch="docs/from-${PR_NUMBER}"
+          git switch -c "$branch"
+
+          # Written by a script rather than a shell loop: a document can
+          # contain anything at all, and every quoting bug here would be a
+          # corrupted file rather than an error.
+          python3 - <<'PY'
+          import json, os, pathlib
+          # Where each published tree lives in the source repository. `docs/`
+          # is published at the same path; the string catalogues are not, so
+          # they are mapped rather than copied.
+          HOMES = {
+              "docs": pathlib.Path("docs"),
+              "translations": pathlib.Path("apps/client/src/pitradio/locale"),
+          }
+          for entry in json.loads(os.environ["FILES"]):
+              path = pathlib.Path(entry["path"])
+              # Re-checked here because this line is the only thing between a
+              # stranger's string and a write.
+              assert ".." not in path.parts, path
+              top = path.parts[0]
+              assert top in HOMES, path
+              if top == "docs":
+                  assert path.suffix == ".md", path
+              else:
+                  assert path.suffix == ".json", path
+                  assert path.name != "template.json", path
+                  assert len(path.parts) == 2, path
+                  # A catalogue that does not parse stops the app starting,
+                  # and hand-editing JSON in a browser is exactly how a
+                  # trailing comma arrives. Fail here, where it is one
+                  # contributor's pull request, rather than upstream.
+                  loaded = json.loads(entry["text"])
+                  assert isinstance(loaded, dict), path
+                  assert all(isinstance(v, str) for v in loaded.values()), path
+              target = HOMES[top] / pathlib.Path(*path.parts[1:])
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_text(entry["text"], encoding="utf-8")
+              print("wrote", target)
+          PY
+
+          if git diff --quiet; then
+            echo "nothing to carry: the files already match"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs apps/client/src/pitradio/locale
+          # The contributor is credited in the trailer rather than as the
+          # author: they did not sign this commit and it is not the tree they
+          # wrote against.
+          git commit -m "From a contributor: ${PR_TITLE}" \
+            -m "Carried up from ${PR_URL}" \
+            -m "Co-authored-by: ${PR_AUTHOR} <${PR_AUTHOR}@users.noreply.github.com>"
+          git push -u origin "$branch" --force
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: Open the upstream pull request
+        if: steps.apply.outputs.changed == 'true'
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_TOKEN }}
+          UPSTREAM: ${{ vars.UPSTREAM_REPO || 'kidunot89/simpitradio-source' }}
+          BRANCH: ${{ steps.apply.outputs.branch }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+        run: |
+          existing=$(gh pr list --repo "$UPSTREAM" --head "$BRANCH" \
+                       --json url --jq '.[0].url // empty')
+          if [ -n "$existing" ]; then
+            echo "url=$existing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          url=$(gh pr create --repo "$UPSTREAM" --head "$BRANCH" --base main \
+                  --title "Docs: ${PR_TITLE}" \
+                  --body "Carried up from ${PR_URL} by @${PR_AUTHOR}.
+
+          The documentation lives here; the public repository is a rendering of
+          it, so contributions arrive this way round.")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Say where it went, and close this one
+        if: always() && steps.collect.outputs.count != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const changed = '${{ steps.apply.outputs.changed }}' === 'true';
+            const body = changed
+              ? [
+                  "Thanks — this has been carried up to the source repository,",
+                  "which is where the documentation actually lives.",
+                  "",
+                  "Closing this one, because everything in this repository is",
+                  "generated and `main` here is replaced wholesale on every",
+                  "publish: a merge would land and then disappear at the next",
+                  "one. Your change will show up here on its own once it is",
+                  "merged upstream, and you are credited on the commit.",
+                ].join("\n")
+              : [
+                  "Thanks — but these files already match what the source",
+                  "repository has, so there is nothing to carry up.",
+                  "",
+                  "Closing this one: `main` here is generated and replaced on",
+                  "every publish, so a pull request against it cannot be",
+                  "merged.",
+                ].join("\n");
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
+            await github.rest.pulls.update({
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              state: "closed",
+            });
